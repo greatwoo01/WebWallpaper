@@ -1,8 +1,10 @@
 import AppKit
+import CoreGraphics
 import WebKit
 
 /// 铺满一块屏幕、位于桌面壁纸之上、桌面图标之下的窗口。
-/// 窗口不接收鼠标事件，因此不会影响桌面图标的点击和拖拽。
+/// 默认不接收鼠标事件，不会影响桌面图标的点击和拖拽；
+/// 进入浏览模式时临时提升层级并接收鼠标 / 键盘事件。
 final class WallpaperWindow: NSPanel {
 
     let webView: WKWebView
@@ -13,6 +15,7 @@ final class WallpaperWindow: NSPanel {
     private var showingWelcome = false
     private var showingError = false
     private var isPaused = false
+    private var isInteractive = false
 
     /// 页面开始跳转 / 窗口卸载时通知外部清理该页面的定位订阅
     var onNavigationStarted: (() -> Void)?
@@ -20,8 +23,8 @@ final class WallpaperWindow: NSPanel {
     /// 摄像头 / 麦克风请求交由外部按站点权限决定
     var onMediaCapturePermission: ((WKSecurityOrigin, WKMediaCaptureType, @escaping (WKPermissionDecision) -> Void) -> Void)?
 
-    override var canBecomeKey: Bool { false }
-    override var canBecomeMain: Bool { false }
+    override var canBecomeKey: Bool { isInteractive }
+    override var canBecomeMain: Bool { isInteractive }
 
     init(screen: NSScreen, permissionBridge: PermissionBridge) {
         let configuration = WKWebViewConfiguration()
@@ -187,6 +190,35 @@ final class WallpaperWindow: NSPanel {
         });
     })();
     """
+
+    // MARK: - 浏览模式
+
+    /// 切换到可交互的浏览模式：仍在原位置铺满屏幕（不是普通带标题栏的窗口），
+    /// 但层级提到普通窗口之上，接收鼠标、滚动、右键与键盘事件。
+    func setInteractive(_ interactive: Bool) {
+        guard interactive != isInteractive else { return }
+        isInteractive = interactive
+
+        if interactive {
+            // 去掉 nonactivatingPanel，点击窗口即可激活应用并获得键盘焦点
+            styleMask = [.borderless]
+            level = NSWindow.Level(rawValue: NSWindow.Level.normal.rawValue + 1)
+            collectionBehavior = [.stationary, .canJoinAllSpaces, .ignoresCycle, .fullScreenAuxiliary]
+            ignoresMouseEvents = false
+            orderFrontRegardless()
+            makeKey()
+            makeFirstResponder(webView)
+        } else {
+            styleMask = [.borderless, .nonactivatingPanel]
+            level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopWindow)) + 1)
+            collectionBehavior = [.stationary, .canJoinAllSpaces, .ignoresCycle]
+            ignoresMouseEvents = true
+            if isKeyWindow {
+                resignKey()
+            }
+            orderFrontRegardless()
+        }
+    }
 
     // MARK: - 加载
 

@@ -13,6 +13,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var screensAsleep = false
     private var sessionInactive = false
 
+    /// 处于浏览模式（可交互）的屏幕标识；按屏幕身份记录，可多屏各自开启
+    private var browsingScreenIDs: Set<String> = []
+    private var escapeMonitor: Any?
+
     private let permissionStore = PermissionStore.shared
     private let locationService = LocationService.shared
     private let permissionBridge = PermissionBridge()
@@ -60,9 +64,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         createWindows()
         setupStatusItem()
         registerObservers()
+
+        // Esc 是浏览模式的统一安全出口：退出所有屏幕的浏览模式
+        escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, event.keyCode == 53, !self.browsingScreenIDs.isEmpty else { return event }
+            self.endAllBrowsing()
+            return nil
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if let escapeMonitor {
+            NSEvent.removeMonitor(escapeMonitor)
+        }
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         NotificationCenter.default.removeObserver(self)
     }
@@ -211,8 +225,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let screenID = ScreenIdentity.identifier(for: screen)
             let enabled = !disabledScreenIDs.contains(screenID)
             let status = enabled ? displayText(for: url(forScreenID: screenID)) : "已停用"
+            let browsingSuffix = browsingScreenIDs.contains(screenID) ? "（浏览模式）" : ""
             let item = NSMenuItem(
-                title: "\(index + 1). \(screen.localizedName) — \(status)",
+                title: "\(index + 1). \(screen.localizedName) — \(status)\(browsingSuffix)",
                 action: nil,
                 keyEquivalent: ""
             )
@@ -242,6 +257,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pauseItem.target = self
         menu.addItem(pauseItem)
 
+        if !browsingScreenIDs.isEmpty {
+            let exitBrowsingItem = NSMenuItem(
+                title: "退出浏览模式（Esc）",
+                action: #selector(exitAllBrowsing),
+                keyEquivalent: ""
+            )
+            exitBrowsingItem.target = self
+            menu.addItem(exitBrowsingItem)
+        }
+
         let permissionsItem = NSMenuItem(
             title: "网页权限…",
             action: #selector(showPermissions),
@@ -268,6 +293,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         toggleItem.representedObject = screenID
         toggleItem.state = enabled ? .on : .off
         submenu.addItem(toggleItem)
+
+        let browseItem = NSMenuItem(
+            title: "浏览模式（可交互）",
+            action: #selector(toggleScreenBrowsing(_:)),
+            keyEquivalent: ""
+        )
+        browseItem.target = self
+        browseItem.representedObject = screenID
+        browseItem.state = browsingScreenIDs.contains(screenID) ? .on : .off
+        browseItem.isEnabled = enabled
+        submenu.addItem(browseItem)
 
         submenu.addItem(.separator())
 
@@ -316,6 +352,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func disableScreen(_ screenID: String) {
         disabledScreenIDs.insert(screenID)
         saveDisabledScreens()
+        browsingScreenIDs.remove(screenID)
 
         // 关闭窗口以释放该屏的 WKWebView / WebContent 进程，露出系统壁纸
         if let window = windowsByScreenID.removeValue(forKey: screenID) {
@@ -338,6 +375,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         windows.append(window)
         windowsByScreenID[screenID] = window
         applyPauseState()
+    }
+
+    // MARK: - 浏览模式
+
+    /// 在「纯壁纸」与「可交互」之间切换单块屏幕，互不影响
+    @objc private func toggleScreenBrowsing(_ sender: NSMenuItem) {
+        guard let screenID = sender.representedObject as? String else { return }
+        if browsingScreenIDs.contains(screenID) {
+            exitBrowsing(screenID: screenID)
+        } else {
+            enterBrowsing(screenID: screenID)
+        }
+    }
+
+    private func enterBrowsing(screenID: String) {
+        guard let window = windowsByScreenID[screenID] else { return }
+        // 暂停时页面已卸载，没有可交互的内容；进入浏览模式会解除手动暂停
+        if manualPaused {
+            manualPaused = false
+            applyPauseState()
+        }
+        browsingScreenIDs.insert(screenID)
+        NSApp.activate(ignoringOtherApps: true)
+        window.setInteractive(true)
+    }
+
+    private func exitBrowsing(screenID: String) {
+        guard browsingScreenIDs.remove(screenID) != nil else { return }
+        windowsByScreenID[screenID]?.setInteractive(false)
+    }
+
+    /// 退出所有屏幕的浏览模式：Esc、菜单、暂停、锁屏、屏幕布局变化共用
+    private func endAllBrowsing() {
+        guard !browsingScreenIDs.isEmpty else { return }
+        for screenID in browsingScreenIDs {
+            windowsByScreenID[screenID]?.setInteractive(false)
+        }
+        browsingScreenIDs.removeAll()
+    }
+
+    @objc private func exitAllBrowsing() {
+        endAllBrowsing()
     }
 
     private func displayText(for url: URL?) -> String {
@@ -438,6 +517,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func togglePause() {
         manualPaused.toggle()
+        if manualPaused {
+            endAllBrowsing()
+        }
         applyPauseState()
     }
 
@@ -753,10 +835,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func handleScreenParametersChange() {
+        // 布局变化会重建窗口，浏览模式不跨重建保留
+        endAllBrowsing()
         createWindows()
     }
 
     @objc private func screensDidSleep() {
+        endAllBrowsing()
         screensAsleep = true
         applyPauseState()
     }
@@ -768,6 +853,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func sessionDidResignActive() {
+        endAllBrowsing()
         sessionInactive = true
         applyPauseState()
     }
